@@ -17,8 +17,8 @@
  */
 typedef struct stage_tag {
     pthread_mutex_t     mutex;          /* Protect data */
-    pthread_cond_t      avail;          /* Data available */
-    pthread_cond_t      ready;          /* Ready for data */
+    pthread_cond_t      avail;          /* Data available notification */
+    pthread_cond_t      ready;          /* Ready for data notification */
     int                 data_ready;     /* Data present */
     long                data;           /* Data to process */
     pthread_t           thread;         /* Thread for stage */
@@ -26,13 +26,12 @@ typedef struct stage_tag {
 } stage_t;
 
 /*
- * External structure representing the entire
- * pipeline.
+ * External structure representing an entire pipeline.
  */
 typedef struct pipe_tag {
     pthread_mutex_t     mutex;          /* Mutex to protect pipe */
     stage_t             *head;          /* First stage */
-    stage_t             *tail;          /* Final stage */
+    stage_t             *tail;          /* Final stage, this stage isn't a working stage. */
     int                 stages;         /* Number of stages */
     int                 active;         /* Active data elements */
 } pipe_t;
@@ -50,9 +49,10 @@ int pipe_send (stage_t *stage, long data)
     if (status != 0)
         return status;
     /*
-     * If there's data in the pipe stage, wait for it
-     * to be consumed.
+     * If there's data in the pipe stage, wait for it to be consumed.
+     * stage->data_ready: the predicate related with the cond 'ready'
      */
+    
     while (stage->data_ready) {
         status = pthread_cond_wait (&stage->ready, &stage->mutex);
         if (status != 0) {
@@ -66,6 +66,10 @@ int pipe_send (stage_t *stage, long data)
      */
     stage->data = data;
     stage->data_ready = 1;
+    /*
+    * stage->mutex is still being locked.
+    * Notify the stage that its input data is ready.
+    */
     status = pthread_cond_signal (&stage->avail);
     if (status != 0) {
         pthread_mutex_unlock (&stage->mutex);
@@ -87,17 +91,25 @@ void *pipe_stage (void *arg)
     stage_t *next_stage = stage->next;
     int status;
 
+    /*
+     * Keep in mind: lock mutex and release it only when ready for handling new data.
+     * And then re-lock mutex.
+     */
     status = pthread_mutex_lock (&stage->mutex);
     if (status != 0)
         err_abort (status, "Lock pipe stage");
     while (1) {
+        /* stage->data_ready != 1: the predicate related with the cond 'avail' */
         while (stage->data_ready != 1) {
+            /* Each thread would block here after being started. */
             status = pthread_cond_wait (&stage->avail, &stage->mutex);
             if (status != 0)
                 err_abort (status, "Wait for previous stage");
         }
         pipe_send (next_stage, stage->data + 1);
         stage->data_ready = 0;
+
+        /* Notify the last stage that it's ready for handling new data. */
         status = pthread_cond_signal (&stage->ready);
         if (status != 0)
             err_abort (status, "Wake next stage");
@@ -151,8 +163,9 @@ int pipe_create (pipe_t *pipe, int stages)
 
     /*
      * Create the threads for the pipe stages only after all
-     * the data is initialized (including all links). Note
-     * that the last stage doesn't get a thread, it's just
+     * the data is initialized (including all links). 
+     * Note:
+     * The last stage doesn't get a thread, it's just
      * a receptacle for the final pipeline value.
      *
      * At this point, proper cleanup on an error would take up
@@ -223,6 +236,11 @@ int pipe_result (pipe_t *pipe, long *result)
 
     pthread_mutex_lock (&tail->mutex);
     while (!tail->data_ready)
+        /*
+        * tail->avail would be signaled by the thread ahead of tail.
+        * And that thread would not block on tail.ready: its predicate that "stage->data_ready"
+        * would always be false.
+        */ 
         pthread_cond_wait (&tail->avail, &tail->mutex);
     *result = tail->data;
     tail->data_ready = 0;
